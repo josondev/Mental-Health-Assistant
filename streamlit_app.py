@@ -119,13 +119,6 @@ def initialize_chatbot(gemini_model: str = "gemini-2.0-flash", database_url: str
         # Initialise DB — non-blocking, failure just means no persistence
         db_ready = db.init_db(database_url or None)
 
-        if not pinecone_key or not google_key:
-            st.error("⚠️ API keys not found. Please add them to Streamlit secrets.")
-            st.stop()
-
-        # Initialise DB — non-blocking, failure just means no persistence
-        db_ready = db.init_db(database_url)
-
         # Initialize Pinecone
         pc = Pinecone(api_key=pinecone_key)
         spec = ServerlessSpec(cloud=pinecone_cloud, region=pinecone_region)
@@ -159,7 +152,6 @@ def initialize_chatbot(gemini_model: str = "gemini-2.0-flash", database_url: str
         llm = ChatGoogleGenerativeAI(
             model=gemini_model,
             temperature=0.1,
-            max_tokens=2048,
             api_key=google_key,
         )
 
@@ -189,6 +181,7 @@ def initialize_chatbot(gemini_model: str = "gemini-2.0-flash", database_url: str
             "You are a compassionate mental health assistant. "
             "Use the following context to answer the question. "
             "Focus ONLY on mental health topics. "
+            "Always complete your response fully — never stop mid-sentence. "
             "If you don't know, say so. Be empathetic and supportive."
             "\n\n{context}"
         )
