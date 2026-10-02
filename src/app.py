@@ -48,7 +48,8 @@ base_retriever=vectorstore.as_retriever(
 ##initialising the llm for the chat model
 llm=ChatGoogleGenerativeAI(
     model="gemini-3-flash-preview",temperature=0.1,
-    max_tokens=1024,
+    max_tokens=2048,        # raised from 1024 — prevents mid-sentence cutoff
+    request_timeout=60,
     api_key=os.getenv("GOOGLE_API_KEY"),
     streaming=True 
 )

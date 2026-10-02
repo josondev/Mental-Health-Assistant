@@ -154,7 +154,8 @@ def initialize_chatbot():
         llm = ChatGoogleGenerativeAI(
             model=gemini_model,
             temperature=0.1,
-            max_tokens=1024,
+            max_tokens=2048,        # raised from 1024 — prevents mid-sentence cutoff
+            request_timeout=60,     # Streamlit Cloud proxy timeout is 30s by default; give Gemini room
             api_key=google_key,
         )
 
