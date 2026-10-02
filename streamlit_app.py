@@ -103,16 +103,21 @@ if "history_loaded" not in st.session_state:
     st.session_state.history_loaded = False
 
 @st.cache_resource
-def initialize_chatbot():
-    """Initialize the RAG chatbot and database (cached to avoid reloading)"""
+def initialize_chatbot(gemini_model: str = "gemini-2.0-flash", database_url: str = ""):
+    """Initialize the RAG chatbot and database (cached per model name + DB URL)"""
     try:
         # Get API keys from Streamlit secrets
         pinecone_key = st.secrets.get("PINECONE_API_KEY", os.getenv("PINECONE_API_KEY"))
         google_key = st.secrets.get("GOOGLE_API_KEY", os.getenv("GOOGLE_API_KEY"))
         pinecone_cloud = st.secrets.get("PINECONE_CLOUD", os.getenv("PINECONE_CLOUD", "aws"))
         pinecone_region = st.secrets.get("PINECONE_REGION", os.getenv("PINECONE_REGION", "us-east-1"))
-        database_url = st.secrets.get("DATABASE_URL", os.getenv("DATABASE_URL"))
-        gemini_model = st.secrets.get("GEMINI_MODEL", os.getenv("GEMINI_MODEL", "gemini-3.8-flash"))
+
+        if not pinecone_key or not google_key:
+            st.error("⚠️ API keys not found. Please add them to Streamlit secrets.")
+            st.stop()
+
+        # Initialise DB — non-blocking, failure just means no persistence
+        db_ready = db.init_db(database_url or None)
 
         if not pinecone_key or not google_key:
             st.error("⚠️ API keys not found. Please add them to Streamlit secrets.")
@@ -154,8 +159,7 @@ def initialize_chatbot():
         llm = ChatGoogleGenerativeAI(
             model=gemini_model,
             temperature=0.1,
-            max_tokens=2048,        # raised from 1024 — prevents mid-sentence cutoff
-            request_timeout=60,     # Streamlit Cloud proxy timeout is 30s by default; give Gemini room
+            max_tokens=2048,
             api_key=google_key,
         )
 
@@ -212,7 +216,9 @@ def initialize_chatbot():
 # Initialize chatbot
 if st.session_state.rag_chain is None:
     with st.spinner("🔄 Loading AI assistant..."):
-        rag_chain, db_ready = initialize_chatbot()
+        _model = st.secrets.get("GEMINI_MODEL", os.getenv("GEMINI_MODEL", "gemini-2.0-flash"))
+        _db_url = st.secrets.get("DATABASE_URL", os.getenv("DATABASE_URL", ""))
+        rag_chain, db_ready = initialize_chatbot(gemini_model=_model, database_url=_db_url)
         st.session_state.rag_chain = rag_chain
         st.session_state.db_ready = db_ready
 
@@ -311,65 +317,53 @@ if prompt := st.chat_input("How can I help you today?"):
 
     # Get bot response
     with st.chat_message("assistant"):
-        try:
-            start_time = time.perf_counter()
+        with st.spinner("Thinking..."):
+            try:
+                start_time = time.perf_counter()
 
-            # Stream tokens as they arrive — no more long "Thinking..." wait
-            response_placeholder = st.empty()
-            full_response = ""
-            retrieved_doc_ids = []
+                result = st.session_state.rag_chain.invoke({
+                    "input": prompt,
+                    "chat_history": st.session_state.chat_history
+                })
 
-            for chunk in st.session_state.rag_chain.stream({
-                "input": prompt,
-                "chat_history": st.session_state.chat_history
-            }):
-                # Accumulate answer tokens and re-render with blinking cursor
-                if chunk.get("answer"):
-                    full_response += chunk["answer"]
-                    response_placeholder.markdown(full_response + "▌")
+                latency = round(time.perf_counter() - start_time, 4)
+                response = result.get("answer", "I'm sorry, I couldn't generate a response.")
 
-                # Capture doc IDs from the context chunk (arrives before answer)
-                if chunk.get("context") and not retrieved_doc_ids:
-                    retrieved_doc_ids = [
-                        doc.metadata.get("doc_id")
-                        or doc.metadata.get("id")
-                        or doc.metadata.get("source")
-                        or ""
-                        for doc in chunk["context"]
-                    ]
+                # Extract retrieved doc IDs for audit
+                context_docs = result.get("context", [])
+                retrieved_doc_ids = [
+                    doc.metadata.get("doc_id")
+                    or doc.metadata.get("id")
+                    or doc.metadata.get("source")
+                    or ""
+                    for doc in context_docs
+                ]
 
-            # Final render — remove blinking cursor
-            response_placeholder.markdown(full_response)
+                st.markdown(response)
 
-            latency = round(time.perf_counter() - start_time, 4)
-            response = full_response or "I'm sorry, I couldn't generate a response."
+                # Persist both turns to DB
+                if st.session_state.db_ready:
+                    try:
+                        db.save_message(
+                            st.session_state.session_id,
+                            "user",
+                            prompt,
+                        )
+                        db.save_message(
+                            st.session_state.session_id,
+                            "assistant",
+                            response,
+                            retrieved_doc_ids=retrieved_doc_ids,
+                            latency_seconds=latency,
+                        )
+                    except Exception:
+                        pass  # DB failure must never crash the chat
 
-            # Persist both turns to DB
-            if st.session_state.db_ready:
-                try:
-                    db.save_message(
-                        st.session_state.session_id,
-                        "user",
-                        prompt,
-                    )
-                    db.save_message(
-                        st.session_state.session_id,
-                        "assistant",
-                        response,
-                        retrieved_doc_ids=retrieved_doc_ids,
-                        latency_seconds=latency,
-                    )
-                except Exception:
-                    pass  # DB failure must never crash the chat
+                st.session_state.chat_history.append(HumanMessage(content=prompt))
+                st.session_state.chat_history.append(AIMessage(content=response))
+                st.session_state.messages.append({"role": "assistant", "content": response})
 
-            # Update in-memory chat history for the RAG chain
-            st.session_state.chat_history.append(HumanMessage(content=prompt))
-            st.session_state.chat_history.append(AIMessage(content=response))
-
-            # Add to display messages
-            st.session_state.messages.append({"role": "assistant", "content": response})
-
-        except Exception as e:
-            error_msg = f"Sorry, I encountered an error: {str(e)}"
-            st.error(error_msg)
-            st.session_state.messages.append({"role": "assistant", "content": error_msg})
+            except Exception as e:
+                error_msg = f"Sorry, I encountered an error: {str(e)}"
+                st.error(error_msg)
+                st.session_state.messages.append({"role": "assistant", "content": error_msg})
