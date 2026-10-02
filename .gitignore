@@ -10,7 +10,8 @@
 
 # Python
 __pycache__/
-*.py[cod]
+*.pyc
+
 
 # Evaluation-generated files
 evaluation/rag_predictions.jsonl

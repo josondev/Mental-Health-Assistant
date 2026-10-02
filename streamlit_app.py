@@ -112,7 +112,7 @@ def initialize_chatbot():
         pinecone_cloud = st.secrets.get("PINECONE_CLOUD", os.getenv("PINECONE_CLOUD", "aws"))
         pinecone_region = st.secrets.get("PINECONE_REGION", os.getenv("PINECONE_REGION", "us-east-1"))
         database_url = st.secrets.get("DATABASE_URL", os.getenv("DATABASE_URL"))
-        gemini_model = st.secrets.get("GEMINI_MODEL", os.getenv("GEMINI_MODEL", "gemini-2.0-flash"))
+        gemini_model = st.secrets.get("GEMINI_MODEL", os.getenv("GEMINI_MODEL", "gemini-3.8-flash"))
 
         if not pinecone_key or not google_key:
             st.error("⚠️ API keys not found. Please add them to Streamlit secrets.")
