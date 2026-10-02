@@ -311,58 +311,65 @@ if prompt := st.chat_input("How can I help you today?"):
 
     # Get bot response
     with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
-            try:
-                start_time = time.perf_counter()
+        try:
+            start_time = time.perf_counter()
 
-                # Invoke RAG chain
-                result = st.session_state.rag_chain.invoke({
-                    "input": prompt,
-                    "chat_history": st.session_state.chat_history
-                })
+            # Stream tokens as they arrive — no more long "Thinking..." wait
+            response_placeholder = st.empty()
+            full_response = ""
+            retrieved_doc_ids = []
 
-                latency = round(time.perf_counter() - start_time, 4)
-                response = result.get("answer", "I'm sorry, I couldn't generate a response.")
+            for chunk in st.session_state.rag_chain.stream({
+                "input": prompt,
+                "chat_history": st.session_state.chat_history
+            }):
+                # Accumulate answer tokens and re-render with blinking cursor
+                if chunk.get("answer"):
+                    full_response += chunk["answer"]
+                    response_placeholder.markdown(full_response + "▌")
 
-                # Extract retrieved doc IDs for audit
-                context_docs = result.get("context", [])
-                retrieved_doc_ids = [
-                    doc.metadata.get("doc_id")
-                    or doc.metadata.get("id")
-                    or doc.metadata.get("source")
-                    or ""
-                    for doc in context_docs
-                ]
+                # Capture doc IDs from the context chunk (arrives before answer)
+                if chunk.get("context") and not retrieved_doc_ids:
+                    retrieved_doc_ids = [
+                        doc.metadata.get("doc_id")
+                        or doc.metadata.get("id")
+                        or doc.metadata.get("source")
+                        or ""
+                        for doc in chunk["context"]
+                    ]
 
-                # Display response
-                st.markdown(response)
+            # Final render — remove blinking cursor
+            response_placeholder.markdown(full_response)
 
-                # Persist both turns to DB
-                if st.session_state.db_ready:
-                    try:
-                        db.save_message(
-                            st.session_state.session_id,
-                            "user",
-                            prompt,
-                        )
-                        db.save_message(
-                            st.session_state.session_id,
-                            "assistant",
-                            response,
-                            retrieved_doc_ids=retrieved_doc_ids,
-                            latency_seconds=latency,
-                        )
-                    except Exception:
-                        pass  # DB failure must never crash the chat
+            latency = round(time.perf_counter() - start_time, 4)
+            response = full_response or "I'm sorry, I couldn't generate a response."
 
-                # Update in-memory chat history for the RAG chain
-                st.session_state.chat_history.append(HumanMessage(content=prompt))
-                st.session_state.chat_history.append(AIMessage(content=response))
+            # Persist both turns to DB
+            if st.session_state.db_ready:
+                try:
+                    db.save_message(
+                        st.session_state.session_id,
+                        "user",
+                        prompt,
+                    )
+                    db.save_message(
+                        st.session_state.session_id,
+                        "assistant",
+                        response,
+                        retrieved_doc_ids=retrieved_doc_ids,
+                        latency_seconds=latency,
+                    )
+                except Exception:
+                    pass  # DB failure must never crash the chat
 
-                # Add to display messages
-                st.session_state.messages.append({"role": "assistant", "content": response})
+            # Update in-memory chat history for the RAG chain
+            st.session_state.chat_history.append(HumanMessage(content=prompt))
+            st.session_state.chat_history.append(AIMessage(content=response))
 
-            except Exception as e:
-                error_msg = f"Sorry, I encountered an error: {str(e)}"
-                st.error(error_msg)
-                st.session_state.messages.append({"role": "assistant", "content": error_msg})
+            # Add to display messages
+            st.session_state.messages.append({"role": "assistant", "content": response})
+
+        except Exception as e:
+            error_msg = f"Sorry, I encountered an error: {str(e)}"
+            st.error(error_msg)
+            st.session_state.messages.append({"role": "assistant", "content": error_msg})
