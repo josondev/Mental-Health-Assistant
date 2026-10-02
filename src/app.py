@@ -1,6 +1,7 @@
 #doing all the imports here 
 import os
 import hashlib
+import time
 from langchain_huggingface import HuggingFaceEmbeddings
 from pinecone import Pinecone,ServerlessSpec,PineconeApiException
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -10,6 +11,7 @@ from langchain_core.messages import HumanMessage,AIMessage
 from langchain.chains import create_history_aware_retriever,create_retrieval_chain
 from langchain_pinecone import PineconeVectorStore
 from dotenv import load_dotenv
+from database import save_message, get_or_create_session
 
 load_dotenv()
 #loading the environment variables from the .env file
@@ -114,10 +116,12 @@ rag_chain=create_retrieval_chain(
 
 chat_history = []
 
-def ask_question_streamed(user_question, current_chat_history):
+def ask_question_streamed(user_question, current_chat_history, session_id=None):
     print("AI: ", end="")
     
     full_ai_response = ""
+    start_time = time.perf_counter()
+
     for chunk in rag_chain.stream({
         "input": user_question,
         "chat_history": current_chat_history,
@@ -128,8 +132,24 @@ def ask_question_streamed(user_question, current_chat_history):
             full_ai_response += chunk["answer"]
             
     print() # Newline after the full streamed response
-    
-    # Update chat history
+
+    latency = round(time.perf_counter() - start_time, 4)
+
+    # Persist to DB — wrapped in try/except so a DB failure never crashes chat
+    if session_id:
+        try:
+            get_or_create_session(session_id)
+            save_message(session_id, "user", user_question)
+            save_message(
+                session_id,
+                "assistant",
+                full_ai_response,
+                latency_seconds=latency,
+            )
+        except Exception:
+            pass  # DB is best-effort; chat continues regardless
+
+    # Update in-memory chat history
     current_chat_history.append(HumanMessage(content=user_question))
     current_chat_history.append(AIMessage(content=full_ai_response))
     return full_ai_response
@@ -164,6 +184,7 @@ def get_document_id(document):
 def ask_question_for_evaluation(
     user_question,
     current_chat_history=None,
+    session_id=None,
 ):
     """
     Non-streaming chatbot call for evaluation.
@@ -177,10 +198,14 @@ def ask_question_for_evaluation(
     if current_chat_history is None:
         current_chat_history = []
 
+    start_time = time.perf_counter()
+
     result = rag_chain.invoke({
         "input": user_question,
         "chat_history": current_chat_history,
     })
+
+    latency = round(time.perf_counter() - start_time, 4)
 
     answer = result.get("answer", "")
     documents = result.get("context", [])
@@ -194,13 +219,28 @@ def ask_question_for_evaluation(
             "metadata": document.metadata or {},
         })
 
+    retrieved_doc_ids = [doc["doc_id"] for doc in retrieved_documents]
+
+    # Persist to DB — wrapped in try/except so a DB failure never crashes eval
+    if session_id:
+        try:
+            get_or_create_session(session_id)
+            save_message(session_id, "user", user_question)
+            save_message(
+                session_id,
+                "assistant",
+                answer,
+                retrieved_doc_ids=retrieved_doc_ids,
+                latency_seconds=latency,
+            )
+        except Exception:
+            pass  # DB is best-effort
+
     return {
         "answer": answer,
         "documents": retrieved_documents,
-        "retrieved_doc_ids": [
-            document["doc_id"]
-            for document in retrieved_documents
-        ],
+        "retrieved_doc_ids": retrieved_doc_ids,
+        "latency_seconds": latency,
     }
 
 def run_cli():

@@ -1,5 +1,21 @@
 import streamlit as st
 import os
+import uuid
+import sys
+import time
+import logging
+from pathlib import Path
+
+# Configure logging once at entrypoint — database.py and other modules
+# use logging.getLogger so their messages are now visible.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+
+# Ensure src/ is on the path so database.py is importable
+sys.path.insert(0, str(Path(__file__).parent / "src"))
+
 from langchain_huggingface import HuggingFaceEmbeddings
 from pinecone import Pinecone, ServerlessSpec, PineconeApiException
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -8,6 +24,8 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain.chains import create_history_aware_retriever, create_retrieval_chain
 from langchain_pinecone import PineconeVectorStore
+import database as db
+from input_guard import validate_user_input, InputTooLongError, EmptyInputError
 
 # Page config
 st.set_page_config(
@@ -77,20 +95,31 @@ if "rag_chain" not in st.session_state:
     st.session_state.rag_chain = None
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
+if "db_ready" not in st.session_state:
+    st.session_state.db_ready = False
+if "history_loaded" not in st.session_state:
+    st.session_state.history_loaded = False
 
 @st.cache_resource
 def initialize_chatbot():
-    """Initialize the RAG chatbot (cached to avoid reloading)"""
+    """Initialize the RAG chatbot and database (cached to avoid reloading)"""
     try:
         # Get API keys from Streamlit secrets
         pinecone_key = st.secrets.get("PINECONE_API_KEY", os.getenv("PINECONE_API_KEY"))
         google_key = st.secrets.get("GOOGLE_API_KEY", os.getenv("GOOGLE_API_KEY"))
         pinecone_cloud = st.secrets.get("PINECONE_CLOUD", os.getenv("PINECONE_CLOUD", "aws"))
         pinecone_region = st.secrets.get("PINECONE_REGION", os.getenv("PINECONE_REGION", "us-east-1"))
+        database_url = st.secrets.get("DATABASE_URL", os.getenv("DATABASE_URL"))
+        gemini_model = st.secrets.get("GEMINI_MODEL", os.getenv("GEMINI_MODEL", "gemini-2.0-flash"))
 
         if not pinecone_key or not google_key:
             st.error("⚠️ API keys not found. Please add them to Streamlit secrets.")
             st.stop()
+
+        # Initialise DB — non-blocking, failure just means no persistence
+        db_ready = db.init_db(database_url)
 
         # Initialize Pinecone
         pc = Pinecone(api_key=pinecone_key)
@@ -123,7 +152,7 @@ def initialize_chatbot():
 
         # Initialize LLM
         llm = ChatGoogleGenerativeAI(
-            model="gemini-3-flash-preview",
+            model=gemini_model,
             temperature=0.1,
             max_tokens=1024,
             api_key=google_key,
@@ -173,16 +202,43 @@ def initialize_chatbot():
             combine_docs_chain=question_answer_chain,
         )
 
-        return rag_chain
+        return rag_chain, db_ready
 
     except Exception as e:
         st.error(f"Error initializing chatbot: {e}")
-        return None
+        return None, False
 
 # Initialize chatbot
 if st.session_state.rag_chain is None:
     with st.spinner("🔄 Loading AI assistant..."):
-        st.session_state.rag_chain = initialize_chatbot()
+        rag_chain, db_ready = initialize_chatbot()
+        st.session_state.rag_chain = rag_chain
+        st.session_state.db_ready = db_ready
+
+# Restore conversation history from DB (runs once per browser session)
+if not st.session_state.history_loaded and st.session_state.db_ready:
+    session_id = st.session_state.session_id
+    db.get_or_create_session(session_id)
+    past_messages = db.load_session_messages(session_id)
+
+    if past_messages:
+        for msg in past_messages:
+            # Rebuild the Streamlit display list
+            st.session_state.messages.append({
+                "role": msg["role"],
+                "content": msg["content"],
+            })
+            # Rebuild the LangChain chat_history list for the RAG chain
+            if msg["role"] == "user":
+                st.session_state.chat_history.append(
+                    HumanMessage(content=msg["content"])
+                )
+            else:
+                st.session_state.chat_history.append(
+                    AIMessage(content=msg["content"])
+                )
+
+    st.session_state.history_loaded = True
 
 # Header
 st.title("🧠 Mental Health Assistant")
@@ -206,11 +262,22 @@ with st.sidebar:
     st.divider()
 
     if st.button("🗑️ Clear Chat History"):
+        # Wipe DB messages for this session and assign a fresh session_id
+        if st.session_state.db_ready:
+            db.delete_session_messages(st.session_state.session_id)
         st.session_state.messages = []
         st.session_state.chat_history = []
+        st.session_state.session_id = str(uuid.uuid4())
+        st.session_state.history_loaded = False
         st.rerun()
 
     st.divider()
+
+    # DB health indicator
+    if st.session_state.db_ready:
+        st.caption("💾 **History:** saved to database")
+    else:
+        st.caption("⚠️ **History:** local only (no DATABASE_URL)")
 
     st.caption("⚠️ **Disclaimer:** This is an AI assistant. For emergencies, contact professional help immediately.")
 
@@ -226,6 +293,16 @@ if prompt := st.chat_input("How can I help you today?"):
         st.error("⚠️ Chatbot not initialized. Please check your API keys.")
         st.stop()
 
+    # Validate input — rejects empty and over-length messages before
+    # they reach the LLM or DB
+    try:
+        prompt = validate_user_input(prompt)
+    except EmptyInputError:
+        st.stop()
+    except InputTooLongError as exc:
+        st.warning(f"⚠️ {exc}")
+        st.stop()
+
     # Add user message
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
@@ -235,22 +312,53 @@ if prompt := st.chat_input("How can I help you today?"):
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
             try:
+                start_time = time.perf_counter()
+
                 # Invoke RAG chain
                 result = st.session_state.rag_chain.invoke({
                     "input": prompt,
                     "chat_history": st.session_state.chat_history
                 })
 
+                latency = round(time.perf_counter() - start_time, 4)
                 response = result.get("answer", "I'm sorry, I couldn't generate a response.")
+
+                # Extract retrieved doc IDs for audit
+                context_docs = result.get("context", [])
+                retrieved_doc_ids = [
+                    doc.metadata.get("doc_id")
+                    or doc.metadata.get("id")
+                    or doc.metadata.get("source")
+                    or ""
+                    for doc in context_docs
+                ]
 
                 # Display response
                 st.markdown(response)
 
-                # Update chat history
+                # Persist both turns to DB
+                if st.session_state.db_ready:
+                    try:
+                        db.save_message(
+                            st.session_state.session_id,
+                            "user",
+                            prompt,
+                        )
+                        db.save_message(
+                            st.session_state.session_id,
+                            "assistant",
+                            response,
+                            retrieved_doc_ids=retrieved_doc_ids,
+                            latency_seconds=latency,
+                        )
+                    except Exception:
+                        pass  # DB failure must never crash the chat
+
+                # Update in-memory chat history for the RAG chain
                 st.session_state.chat_history.append(HumanMessage(content=prompt))
                 st.session_state.chat_history.append(AIMessage(content=response))
 
-                # Add to messages
+                # Add to display messages
                 st.session_state.messages.append({"role": "assistant", "content": response})
 
             except Exception as e:
